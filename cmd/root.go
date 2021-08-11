@@ -9,8 +9,6 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/nektos/act/pkg/common"
-
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/andreaskoch/go-fswatch"
 	"github.com/joho/godotenv"
@@ -19,6 +17,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
+	"github.com/nektos/act/pkg/common"
 	"github.com/nektos/act/pkg/model"
 	"github.com/nektos/act/pkg/runner"
 )
@@ -40,7 +39,7 @@ func Execute(ctx context.Context, version string) {
 	rootCmd.Flags().BoolP("graph", "g", false, "draw workflows")
 	rootCmd.Flags().StringP("job", "j", "", "run job")
 	rootCmd.Flags().StringArrayVarP(&input.secrets, "secret", "s", []string{}, "secret to make available to actions with optional value (e.g. -s mysecret=foo or -s mysecret)")
-	rootCmd.Flags().StringArrayVarP(&input.envs, "env", "", []string{}, "env to make available to actions with optional value (e.g. --e myenv=foo or -s myenv)")
+	rootCmd.Flags().StringArrayVarP(&input.envs, "env", "", []string{}, "env to make available to actions with optional value (e.g. --env myenv=foo or --env myenv)")
 	rootCmd.Flags().StringArrayVarP(&input.platforms, "platform", "P", []string{}, "custom image to use per platform (e.g. -P ubuntu-18.04=nektos/act-environments-ubuntu:18.04)")
 	rootCmd.Flags().BoolVarP(&input.reuseContainers, "reuse", "r", false, "reuse action containers to maintain state")
 	rootCmd.Flags().BoolVarP(&input.bindWorkdir, "bind", "b", false, "bind working directory to container, rather than copy")
@@ -50,8 +49,13 @@ func Execute(ctx context.Context, version string) {
 	rootCmd.Flags().StringVar(&input.defaultBranch, "defaultbranch", "", "the name of the main branch")
 	rootCmd.Flags().BoolVar(&input.privileged, "privileged", false, "use privileged mode")
 	rootCmd.Flags().StringVar(&input.usernsMode, "userns", "", "user namespace to use")
+	rootCmd.Flags().BoolVar(&input.useGitIgnore, "use-gitignore", true, "Controls whether paths specified in .gitignore should be copied into container")
+	rootCmd.Flags().StringArrayVarP(&input.containerCapAdd, "container-cap-add", "", []string{}, "kernel capabilities to add to the workflow containers (e.g. --container-cap-add SYS_PTRACE)")
+	rootCmd.Flags().StringArrayVarP(&input.containerCapDrop, "container-cap-drop", "", []string{}, "kernel capabilities to remove from the workflow containers (e.g. --container-cap-drop SYS_PTRACE)")
+	rootCmd.Flags().BoolVar(&input.autoRemove, "rm", false, "automatically remove containers just before exit")
 	rootCmd.PersistentFlags().StringVarP(&input.actor, "actor", "a", "nektos/act", "user that triggered the event")
 	rootCmd.PersistentFlags().StringVarP(&input.workflowsPath, "workflows", "W", "./.github/workflows/", "path to workflow file(s)")
+	rootCmd.PersistentFlags().BoolVarP(&input.noWorkflowRecurse, "no-recurse", "", false, "Flag to disable running workflows from subdirectories of specified path in '--workflows'/'-W' flag")
 	rootCmd.PersistentFlags().StringVarP(&input.workdir, "directory", "C", ".", "working directory")
 	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "verbose output")
 	rootCmd.PersistentFlags().BoolVarP(&input.noOutput, "quiet", "q", false, "disable logging of output from steps")
@@ -59,13 +63,14 @@ func Execute(ctx context.Context, version string) {
 	rootCmd.PersistentFlags().StringVarP(&input.secretfile, "secret-file", "", ".secrets", "file with list of secrets to read from (e.g. --secret-file .secrets)")
 	rootCmd.PersistentFlags().BoolVarP(&input.insecureSecrets, "insecure-secrets", "", false, "NOT RECOMMENDED! Doesn't hide secrets while printing logs.")
 	rootCmd.PersistentFlags().StringVarP(&input.envfile, "env-file", "", ".env", "environment file to read and use as env in the containers")
-	rootCmd.PersistentFlags().StringVarP(&input.containerArchitecture, "container-architecture", "", "", "Architecture which should be used to run containers, e.g.: linux/amd64. Defaults to linux/<your machine architecture> [linux/"+runtime.GOARCH+"]. Requires Docker server API Version 1.41+. Ignored on earlier Docker server platforms.")
+	rootCmd.PersistentFlags().StringVarP(&input.containerArchitecture, "container-architecture", "", "", "Architecture which should be used to run containers, e.g.: linux/amd64. If not specified, will use host default architecture. Requires Docker server API Version 1.41+. Ignored on earlier Docker server platforms.")
+	rootCmd.PersistentFlags().StringVarP(&input.containerDaemonSocket, "container-daemon-socket", "", "/var/run/docker.sock", "Path to Docker daemon socket which will be mounted to containers")
+	rootCmd.PersistentFlags().StringVarP(&input.githubInstance, "github-instance", "", "github.com", "GitHub instance to use. Don't use this if you are not using GitHub Enterprise Server.")
 	rootCmd.SetArgs(args())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
-
 }
 
 func configLocations() []string {
@@ -144,8 +149,18 @@ func readEnvs(path string, envs map[string]string) bool {
 	return false
 }
 
+//nolint:gocyclo
 func newRunCommand(ctx context.Context, input *Input) func(*cobra.Command, []string) error {
 	return func(cmd *cobra.Command, args []string) error {
+		if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" && input.containerArchitecture == "" {
+			l := log.New()
+			l.SetFormatter(&log.TextFormatter{
+				DisableQuote:     true,
+				DisableTimestamp: true,
+			})
+			l.Warnf(" \U000026A0 You are using Apple M1 chip and you have not specified container architecture, you might encounter issues while running act. If so, try running it with '--container-architecture linux/amd64'. \U000026A0 \n")
+		}
+
 		log.Debugf("Loading environment from %s", input.Envfile())
 		envs := make(map[string]string)
 		if input.envs != nil {
@@ -164,7 +179,7 @@ func newRunCommand(ctx context.Context, input *Input) func(*cobra.Command, []str
 		secrets := newSecrets(input.secrets)
 		_ = readEnvs(input.Secretfile(), secrets)
 
-		planner, err := model.NewWorkflowPlanner(input.WorkflowsPath())
+		planner, err := model.NewWorkflowPlanner(input.WorkflowsPath(), input.noWorkflowRecurse)
 		if err != nil {
 			return err
 		}
@@ -253,6 +268,12 @@ func newRunCommand(ctx context.Context, input *Input) func(*cobra.Command, []str
 			Privileged:            input.privileged,
 			UsernsMode:            input.usernsMode,
 			ContainerArchitecture: input.containerArchitecture,
+			ContainerDaemonSocket: input.containerDaemonSocket,
+			UseGitIgnore:          input.useGitIgnore,
+			GitHubInstance:        input.githubInstance,
+			ContainerCapAdd:       input.containerCapAdd,
+			ContainerCapDrop:      input.containerCapDrop,
+			AutoRemove:            input.autoRemove,
 		}
 		r, err := runner.New(config)
 		if err != nil {
@@ -287,11 +308,11 @@ func defaultImageSurvey(actrc string) error {
 	var option string
 	switch answer {
 	case "Large":
-		option = "-P ubuntu-18.04=nektos/act-environments-ubuntu:18.04"
+		option = "-P ubuntu-latest=ghcr.io/catthehacker/ubuntu:full-latest\n-P ubuntu-latest=ghcr.io/catthehacker/ubuntu:full-20.04\n-P ubuntu-18.04=ghcr.io/catthehacker/ubuntu:full-18.04\n"
 	case "Medium":
-		option = "-P ubuntu-latest=catthehacker/ubuntu:act-latest\n-P ubuntu-20.04=catthehacker/ubuntu:act-20.04\n-P ubuntu-18.04=catthehacker/ubuntu:act-18.04\nubuntu-16.04=catthehacker/ubuntu:act-16.04"
+		option = "-P ubuntu-latest=ghcr.io/catthehacker/ubuntu:act-latest\n-P ubuntu-20.04=ghcr.io/catthehacker/ubuntu:act-20.04\n-P ubuntu-18.04=ghcr.io/catthehacker/ubuntu:act-18.04\n-P ubuntu-16.04=ghcr.io/catthehacker/ubuntu:act-16.04\n"
 	case "Micro":
-		option = "-P ubuntu-latest=node:12.20.1-buster-slim\n-P ubuntu-20.04=node:12.20.1-buster-slim\n-P ubuntu-18.04=node:12.20.1-buster-slim\n-P ubuntu-16.04=node:12.20.1-stretch-slim"
+		option = "-P ubuntu-latest=node:12-buster-slim\n-P ubuntu-20.04=node:12-buster-slim\n-P ubuntu-18.04=node:12-buster-slim\n-P ubuntu-16.04=node:12-stretch-slim\n"
 	}
 
 	f, err := os.Create(actrc)
