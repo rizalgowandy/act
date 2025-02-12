@@ -1,38 +1,61 @@
 package runner
 
 import (
+	"archive/tar"
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 
-	"github.com/mitchellh/go-homedir"
-	log "github.com/sirupsen/logrus"
-
+	"github.com/docker/go-connections/nat"
 	"github.com/nektos/act/pkg/common"
 	"github.com/nektos/act/pkg/container"
+	"github.com/nektos/act/pkg/exprparser"
 	"github.com/nektos/act/pkg/model"
+	"github.com/opencontainers/selinux/go-selinux"
 )
 
 // RunContext contains info about current job
 type RunContext struct {
-	Name           string
-	Config         *Config
-	Matrix         map[string]interface{}
-	Run            *model.Run
-	EventJSON      string
-	Env            map[string]string
-	ExtraPath      []string
-	CurrentStep    string
-	StepResults    map[string]*stepResult
-	ExprEval       ExpressionEvaluator
-	JobContainer   container.Container
-	OutputMappings map[MappableOutput]MappableOutput
+	Name                string
+	Config              *Config
+	Matrix              map[string]interface{}
+	Run                 *model.Run
+	EventJSON           string
+	Env                 map[string]string
+	GlobalEnv           map[string]string // to pass env changes of GITHUB_ENV and set-env correctly, due to dirty Env field
+	ExtraPath           []string
+	CurrentStep         string
+	StepResults         map[string]*model.StepResult
+	IntraActionState    map[string]map[string]string
+	ExprEval            ExpressionEvaluator
+	JobContainer        container.ExecutionsEnvironment
+	ServiceContainers   []container.ExecutionsEnvironment
+	OutputMappings      map[MappableOutput]MappableOutput
+	JobName             string
+	ActionPath          string
+	Parent              *RunContext
+	Masks               []string
+	cleanUpJobContainer common.Executor
+	caller              *caller // job calling this RunContext (reusable workflows)
+	nodeToolFullPath    string
+}
+
+func (rc *RunContext) AddMask(mask string) {
+	rc.Masks = append(rc.Masks, mask)
 }
 
 type MappableOutput struct {
@@ -41,18 +64,25 @@ type MappableOutput struct {
 }
 
 func (rc *RunContext) String() string {
-	return fmt.Sprintf("%s/%s", rc.Run.Workflow.Name, rc.Name)
-}
-
-type stepResult struct {
-	Success bool              `json:"success"`
-	Outputs map[string]string `json:"outputs"`
+	name := fmt.Sprintf("%s/%s", rc.Run.Workflow.Name, rc.Name)
+	if rc.caller != nil {
+		// prefix the reusable workflow with the caller job
+		// this is required to create unique container names
+		name = fmt.Sprintf("%s/%s", rc.caller.runContext.Name, name)
+	}
+	return name
 }
 
 // GetEnv returns the env for the context
 func (rc *RunContext) GetEnv() map[string]string {
 	if rc.Env == nil {
-		rc.Env = mergeMaps(rc.Config.Env, rc.Run.Workflow.Env, rc.Run.Job().Env)
+		rc.Env = map[string]string{}
+		if rc.Run != nil && rc.Run.Workflow != nil && rc.Config != nil {
+			job := rc.Run.Job()
+			if job != nil {
+				rc.Env = mergeMaps(rc.Run.Workflow.Env, job.Environment(), rc.Config.Env)
+			}
+		}
 	}
 	rc.Env["ACT"] = "true"
 	return rc.Env
@@ -62,11 +92,162 @@ func (rc *RunContext) jobContainerName() string {
 	return createContainerName("act", rc.String())
 }
 
-func (rc *RunContext) startJobContainer() common.Executor {
-	image := rc.platformImage()
+// networkName return the name of the network which will be created by `act` automatically for job,
+// only create network if using a service container
+func (rc *RunContext) networkName() (string, bool) {
+	if len(rc.Run.Job().Services) > 0 {
+		return fmt.Sprintf("%s-%s-network", rc.jobContainerName(), rc.Run.JobID), true
+	}
+	if rc.Config.ContainerNetworkMode == "" {
+		return "host", false
+	}
+	return string(rc.Config.ContainerNetworkMode), false
+}
 
+func getDockerDaemonSocketMountPath(daemonPath string) string {
+	if protoIndex := strings.Index(daemonPath, "://"); protoIndex != -1 {
+		scheme := daemonPath[:protoIndex]
+		if strings.EqualFold(scheme, "npipe") {
+			// linux container mount on windows, use the default socket path of the VM / wsl2
+			return "/var/run/docker.sock"
+		} else if strings.EqualFold(scheme, "unix") {
+			return daemonPath[protoIndex+3:]
+		} else if strings.IndexFunc(scheme, func(r rune) bool {
+			return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z')
+		}) == -1 {
+			// unknown protocol use default
+			return "/var/run/docker.sock"
+		}
+	}
+	return daemonPath
+}
+
+// Returns the binds and mounts for the container, resolving paths as appropriate
+func (rc *RunContext) GetBindsAndMounts() ([]string, map[string]string) {
+	name := rc.jobContainerName()
+
+	if rc.Config.ContainerDaemonSocket == "" {
+		rc.Config.ContainerDaemonSocket = "/var/run/docker.sock"
+	}
+
+	binds := []string{}
+	if rc.Config.ContainerDaemonSocket != "-" {
+		daemonPath := getDockerDaemonSocketMountPath(rc.Config.ContainerDaemonSocket)
+		binds = append(binds, fmt.Sprintf("%s:%s", daemonPath, "/var/run/docker.sock"))
+	}
+
+	ext := container.LinuxContainerEnvironmentExtensions{}
+
+	mounts := map[string]string{
+		"act-toolcache": "/opt/hostedtoolcache",
+		name + "-env":   ext.GetActPath(),
+	}
+
+	if job := rc.Run.Job(); job != nil {
+		if container := job.Container(); container != nil {
+			for _, v := range container.Volumes {
+				if !strings.Contains(v, ":") || filepath.IsAbs(v) {
+					// Bind anonymous volume or host file.
+					binds = append(binds, v)
+				} else {
+					// Mount existing volume.
+					paths := strings.SplitN(v, ":", 2)
+					mounts[paths[0]] = paths[1]
+				}
+			}
+		}
+	}
+
+	if rc.Config.BindWorkdir {
+		bindModifiers := ""
+		if runtime.GOOS == "darwin" {
+			bindModifiers = ":delegated"
+		}
+		if selinux.GetEnabled() {
+			bindModifiers = ":z"
+		}
+		binds = append(binds, fmt.Sprintf("%s:%s%s", rc.Config.Workdir, ext.ToContainerPath(rc.Config.Workdir), bindModifiers))
+	} else {
+		mounts[name] = ext.ToContainerPath(rc.Config.Workdir)
+	}
+
+	return binds, mounts
+}
+
+func (rc *RunContext) startHostEnvironment() common.Executor {
 	return func(ctx context.Context) error {
-		rawLogger := common.Logger(ctx).WithField("raw_output", true)
+		logger := common.Logger(ctx)
+		rawLogger := logger.WithField("raw_output", true)
+		logWriter := common.NewLineWriter(rc.commandHandler(ctx), func(s string) bool {
+			if rc.Config.LogOutput {
+				rawLogger.Infof("%s", s)
+			} else {
+				rawLogger.Debugf("%s", s)
+			}
+			return true
+		})
+		cacheDir := rc.ActionCacheDir()
+		randBytes := make([]byte, 8)
+		_, _ = rand.Read(randBytes)
+		miscpath := filepath.Join(cacheDir, hex.EncodeToString(randBytes))
+		actPath := filepath.Join(miscpath, "act")
+		if err := os.MkdirAll(actPath, 0o777); err != nil {
+			return err
+		}
+		path := filepath.Join(miscpath, "hostexecutor")
+		if err := os.MkdirAll(path, 0o777); err != nil {
+			return err
+		}
+		runnerTmp := filepath.Join(miscpath, "tmp")
+		if err := os.MkdirAll(runnerTmp, 0o777); err != nil {
+			return err
+		}
+		toolCache := filepath.Join(cacheDir, "tool_cache")
+		rc.JobContainer = &container.HostEnvironment{
+			Path:      path,
+			TmpDir:    runnerTmp,
+			ToolCache: toolCache,
+			Workdir:   rc.Config.Workdir,
+			ActPath:   actPath,
+			CleanUp: func() {
+				os.RemoveAll(miscpath)
+			},
+			StdOut: logWriter,
+		}
+		rc.cleanUpJobContainer = rc.JobContainer.Remove()
+		for k, v := range rc.JobContainer.GetRunnerContext(ctx) {
+			if v, ok := v.(string); ok {
+				rc.Env[fmt.Sprintf("RUNNER_%s", strings.ToUpper(k))] = v
+			}
+		}
+		for _, env := range os.Environ() {
+			if k, v, ok := strings.Cut(env, "="); ok {
+				// don't override
+				if _, ok := rc.Env[k]; !ok {
+					rc.Env[k] = v
+				}
+			}
+		}
+
+		return common.NewPipelineExecutor(
+			rc.JobContainer.Copy(rc.JobContainer.GetActPath()+"/", &container.FileEntry{
+				Name: "workflow/event.json",
+				Mode: 0o644,
+				Body: rc.EventJSON,
+			}, &container.FileEntry{
+				Name: "workflow/envs.txt",
+				Mode: 0o666,
+				Body: "",
+			}),
+		)(ctx)
+	}
+}
+
+func (rc *RunContext) startJobContainer() common.Executor {
+	return func(ctx context.Context) error {
+		logger := common.Logger(ctx)
+		image := rc.platformImage(ctx)
+		rawLogger := logger.WithField("raw_output", true)
 		logWriter := common.NewLineWriter(rc.commandHandler(ctx), func(s string) bool {
 			if rc.Config.LogOutput {
 				rawLogger.Infof("%s", s)
@@ -76,197 +257,483 @@ func (rc *RunContext) startJobContainer() common.Executor {
 			return true
 		})
 
-		common.Logger(ctx).Infof("\U0001f680  Start image=%s", image)
+		username, password, err := rc.handleCredentials(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to handle credentials: %s", err)
+		}
+
+		logger.Infof("\U0001f680  Start image=%s", image)
 		name := rc.jobContainerName()
 
 		envList := make([]string, 0)
-		bindModifiers := ""
-		if runtime.GOOS == "darwin" {
-			bindModifiers = ":delegated"
-		}
 
 		envList = append(envList, fmt.Sprintf("%s=%s", "RUNNER_TOOL_CACHE", "/opt/hostedtoolcache"))
 		envList = append(envList, fmt.Sprintf("%s=%s", "RUNNER_OS", "Linux"))
+		envList = append(envList, fmt.Sprintf("%s=%s", "RUNNER_ARCH", container.RunnerArch(ctx)))
 		envList = append(envList, fmt.Sprintf("%s=%s", "RUNNER_TEMP", "/tmp"))
+		envList = append(envList, fmt.Sprintf("%s=%s", "LANG", "C.UTF-8")) // Use same locale as GitHub Actions
 
-		binds := []string{
-			fmt.Sprintf("%s:%s", "/var/run/docker.sock", "/var/run/docker.sock"),
-		}
-		if rc.Config.BindWorkdir {
-			binds = append(binds, fmt.Sprintf("%s:%s%s", rc.Config.Workdir, rc.Config.Workdir, bindModifiers))
+		ext := container.LinuxContainerEnvironmentExtensions{}
+		binds, mounts := rc.GetBindsAndMounts()
+
+		// specify the network to which the container will connect when `docker create` stage. (like execute command line: docker create --network <networkName> <image>)
+		// if using service containers, will create a new network for the containers.
+		// and it will be removed after at last.
+		networkName, createAndDeleteNetwork := rc.networkName()
+
+		// add service containers
+		for serviceID, spec := range rc.Run.Job().Services {
+			// interpolate env
+			interpolatedEnvs := make(map[string]string, len(spec.Env))
+			for k, v := range spec.Env {
+				interpolatedEnvs[k] = rc.ExprEval.Interpolate(ctx, v)
+			}
+			envs := make([]string, 0, len(interpolatedEnvs))
+			for k, v := range interpolatedEnvs {
+				envs = append(envs, fmt.Sprintf("%s=%s", k, v))
+			}
+			username, password, err = rc.handleServiceCredentials(ctx, spec.Credentials)
+			if err != nil {
+				return fmt.Errorf("failed to handle service %s credentials: %w", serviceID, err)
+			}
+
+			interpolatedVolumes := make([]string, 0, len(spec.Volumes))
+			for _, volume := range spec.Volumes {
+				interpolatedVolumes = append(interpolatedVolumes, rc.ExprEval.Interpolate(ctx, volume))
+			}
+			serviceBinds, serviceMounts := rc.GetServiceBindsAndMounts(interpolatedVolumes)
+
+			interpolatedPorts := make([]string, 0, len(spec.Ports))
+			for _, port := range spec.Ports {
+				interpolatedPorts = append(interpolatedPorts, rc.ExprEval.Interpolate(ctx, port))
+			}
+			exposedPorts, portBindings, err := nat.ParsePortSpecs(interpolatedPorts)
+			if err != nil {
+				return fmt.Errorf("failed to parse service %s ports: %w", serviceID, err)
+			}
+
+			imageName := rc.ExprEval.Interpolate(ctx, spec.Image)
+			if imageName == "" {
+				logger.Infof("The service '%s' will not be started because the container definition has an empty image.", serviceID)
+				continue
+			}
+
+			serviceContainerName := createContainerName(rc.jobContainerName(), serviceID)
+			c := container.NewContainer(&container.NewContainerInput{
+				Name:           serviceContainerName,
+				WorkingDir:     ext.ToContainerPath(rc.Config.Workdir),
+				Image:          imageName,
+				Username:       username,
+				Password:       password,
+				Env:            envs,
+				Mounts:         serviceMounts,
+				Binds:          serviceBinds,
+				Stdout:         logWriter,
+				Stderr:         logWriter,
+				Privileged:     rc.Config.Privileged,
+				UsernsMode:     rc.Config.UsernsMode,
+				Platform:       rc.Config.ContainerArchitecture,
+				Options:        rc.ExprEval.Interpolate(ctx, spec.Options),
+				NetworkMode:    networkName,
+				NetworkAliases: []string{serviceID},
+				ExposedPorts:   exposedPorts,
+				PortBindings:   portBindings,
+			})
+			rc.ServiceContainers = append(rc.ServiceContainers, c)
 		}
 
-		if rc.Config.ContainerArchitecture == "" {
-			rc.Config.ContainerArchitecture = fmt.Sprintf("%s/%s", "linux", runtime.GOARCH)
+		rc.cleanUpJobContainer = func(ctx context.Context) error {
+			reuseJobContainer := func(_ context.Context) bool {
+				return rc.Config.ReuseContainers
+			}
+
+			if rc.JobContainer != nil {
+				return rc.JobContainer.Remove().IfNot(reuseJobContainer).
+					Then(container.NewDockerVolumeRemoveExecutor(rc.jobContainerName(), false)).IfNot(reuseJobContainer).
+					Then(container.NewDockerVolumeRemoveExecutor(rc.jobContainerName()+"-env", false)).IfNot(reuseJobContainer).
+					Then(func(ctx context.Context) error {
+						if len(rc.ServiceContainers) > 0 {
+							logger.Infof("Cleaning up services for job %s", rc.JobName)
+							if err := rc.stopServiceContainers()(ctx); err != nil {
+								logger.Errorf("Error while cleaning services: %v", err)
+							}
+							if createAndDeleteNetwork {
+								// clean network if it has been created by act
+								// if using service containers
+								// it means that the network to which containers are connecting is created by `act_runner`,
+								// so, we should remove the network at last.
+								logger.Infof("Cleaning up network for job %s, and network name is: %s", rc.JobName, networkName)
+								if err := container.NewDockerNetworkRemoveExecutor(networkName)(ctx); err != nil {
+									logger.Errorf("Error while cleaning network: %v", err)
+								}
+							}
+						}
+						return nil
+					})(ctx)
+			}
+			return nil
+		}
+
+		jobContainerNetwork := rc.Config.ContainerNetworkMode.NetworkName()
+		if rc.containerImage(ctx) != "" {
+			jobContainerNetwork = networkName
+		} else if jobContainerNetwork == "" {
+			jobContainerNetwork = "host"
 		}
 
 		rc.JobContainer = container.NewContainer(&container.NewContainerInput{
-			Cmd:        nil,
-			Entrypoint: []string{"/usr/bin/tail", "-f", "/dev/null"},
-			WorkingDir: rc.Config.Workdir,
-			Image:      image,
-			Name:       name,
-			Env:        envList,
-			Mounts: map[string]string{
-				name:            filepath.Dir(rc.Config.Workdir),
-				"act-toolcache": "/toolcache",
-				"act-actions":   "/actions",
-			},
-			NetworkMode: "host",
-			Binds:       binds,
-			Stdout:      logWriter,
-			Stderr:      logWriter,
-			Privileged:  rc.Config.Privileged,
-			UsernsMode:  rc.Config.UsernsMode,
-			Platform:    rc.Config.ContainerArchitecture,
+			Cmd:            nil,
+			Entrypoint:     []string{"tail", "-f", "/dev/null"},
+			WorkingDir:     ext.ToContainerPath(rc.Config.Workdir),
+			Image:          image,
+			Username:       username,
+			Password:       password,
+			Name:           name,
+			Env:            envList,
+			Mounts:         mounts,
+			NetworkMode:    jobContainerNetwork,
+			NetworkAliases: []string{rc.Name},
+			Binds:          binds,
+			Stdout:         logWriter,
+			Stderr:         logWriter,
+			Privileged:     rc.Config.Privileged,
+			UsernsMode:     rc.Config.UsernsMode,
+			Platform:       rc.Config.ContainerArchitecture,
+			Options:        rc.options(ctx),
 		})
-
-		var copyWorkspace bool
-		var copyToPath string
-		if !rc.Config.BindWorkdir {
-			copyToPath, copyWorkspace = rc.localCheckoutPath()
-			copyToPath = filepath.Join(rc.Config.Workdir, copyToPath)
+		if rc.JobContainer == nil {
+			return errors.New("Failed to create job container")
 		}
 
 		return common.NewPipelineExecutor(
+			rc.pullServicesImages(rc.Config.ForcePull),
 			rc.JobContainer.Pull(rc.Config.ForcePull),
 			rc.stopJobContainer(),
-			rc.JobContainer.Create(),
+			container.NewDockerNetworkCreateExecutor(networkName).IfBool(createAndDeleteNetwork),
+			rc.startServiceContainers(networkName),
+			rc.JobContainer.Create(rc.Config.ContainerCapAdd, rc.Config.ContainerCapDrop),
 			rc.JobContainer.Start(false),
-			rc.JobContainer.CopyDir(copyToPath, rc.Config.Workdir+string(filepath.Separator)+".").IfBool(copyWorkspace),
-			rc.JobContainer.Copy(filepath.Dir(rc.Config.Workdir), &container.FileEntry{
+			rc.JobContainer.Copy(rc.JobContainer.GetActPath()+"/", &container.FileEntry{
 				Name: "workflow/event.json",
-				Mode: 0644,
+				Mode: 0o644,
 				Body: rc.EventJSON,
 			}, &container.FileEntry{
 				Name: "workflow/envs.txt",
-				Mode: 0644,
-				Body: "",
-			}, &container.FileEntry{
-				Name: "home/.act",
-				Mode: 0644,
+				Mode: 0o666,
 				Body: "",
 			}),
+			rc.waitForServiceContainers(),
 		)(ctx)
 	}
 }
-func (rc *RunContext) execJobContainer(cmd []string, env map[string]string) common.Executor {
+
+func (rc *RunContext) execJobContainer(cmd []string, env map[string]string, user, workdir string) common.Executor {
 	return func(ctx context.Context) error {
-		return rc.JobContainer.Exec(cmd, env)(ctx)
+		return rc.JobContainer.Exec(cmd, env, user, workdir)(ctx)
 	}
 }
 
-// stopJobContainer removes the job container (if it exists) and its volume (if it exists) if !rc.Config.ReuseContainers
+func (rc *RunContext) InitializeNodeTool() common.Executor {
+	return func(ctx context.Context) error {
+		rc.GetNodeToolFullPath(ctx)
+		return nil
+	}
+}
+
+func (rc *RunContext) GetNodeToolFullPath(ctx context.Context) string {
+	if rc.nodeToolFullPath == "" {
+		timeed, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		path := rc.JobContainer.GetPathVariableName()
+		cenv := map[string]string{}
+		var cpath string
+		if err := rc.JobContainer.UpdateFromImageEnv(&cenv)(ctx); err == nil {
+			if p, ok := cenv[path]; ok {
+				cpath = p
+			}
+		}
+		if len(cpath) == 0 {
+			cpath = rc.JobContainer.DefaultPathVariable()
+		}
+		cenv[path] = cpath
+		hout := &bytes.Buffer{}
+		herr := &bytes.Buffer{}
+		stdout, stderr := rc.JobContainer.ReplaceLogWriter(hout, herr)
+		err := rc.execJobContainer([]string{"node", "--no-warnings", "-e", "console.log(process.execPath)"},
+			cenv, "", "").
+			Finally(func(context.Context) error {
+				rc.JobContainer.ReplaceLogWriter(stdout, stderr)
+				return nil
+			})(timeed)
+		rawStr := strings.Trim(hout.String(), "\r\n")
+		if err == nil && !strings.ContainsAny(rawStr, "\r\n") {
+			rc.nodeToolFullPath = rawStr
+		} else {
+			rc.nodeToolFullPath = "node"
+		}
+	}
+	return rc.nodeToolFullPath
+}
+
+func (rc *RunContext) ApplyExtraPath(ctx context.Context, env *map[string]string) {
+	if len(rc.ExtraPath) > 0 {
+		path := rc.JobContainer.GetPathVariableName()
+		if rc.JobContainer.IsEnvironmentCaseInsensitive() {
+			// On windows system Path and PATH could also be in the map
+			for k := range *env {
+				if strings.EqualFold(path, k) {
+					path = k
+					break
+				}
+			}
+		}
+		if (*env)[path] == "" {
+			cenv := map[string]string{}
+			var cpath string
+			if err := rc.JobContainer.UpdateFromImageEnv(&cenv)(ctx); err == nil {
+				if p, ok := cenv[path]; ok {
+					cpath = p
+				}
+			}
+			if len(cpath) == 0 {
+				cpath = rc.JobContainer.DefaultPathVariable()
+			}
+			(*env)[path] = cpath
+		}
+		(*env)[path] = rc.JobContainer.JoinPathVariable(append(rc.ExtraPath, (*env)[path])...)
+	}
+}
+
+func (rc *RunContext) UpdateExtraPath(ctx context.Context, githubEnvPath string) error {
+	if common.Dryrun(ctx) {
+		return nil
+	}
+	pathTar, err := rc.JobContainer.GetContainerArchive(ctx, githubEnvPath)
+	if err != nil {
+		return err
+	}
+	defer pathTar.Close()
+
+	reader := tar.NewReader(pathTar)
+	_, err = reader.Next()
+	if err != nil && err != io.EOF {
+		return err
+	}
+	s := bufio.NewScanner(reader)
+	firstLine := true
+	for s.Scan() {
+		line := s.Text()
+		if firstLine {
+			firstLine = false
+			// skip utf8 bom, powershell 5 legacy uses it for utf8
+			if len(line) >= 3 && line[0] == 239 && line[1] == 187 && line[2] == 191 {
+				line = line[3:]
+			}
+		}
+		if len(line) > 0 {
+			rc.addPath(ctx, line)
+		}
+	}
+	return nil
+}
+
+// stopJobContainer removes the job container (if it exists) and its volume (if it exists)
 func (rc *RunContext) stopJobContainer() common.Executor {
 	return func(ctx context.Context) error {
-		if rc.JobContainer != nil && !rc.Config.ReuseContainers {
-			return rc.JobContainer.Remove().
-				Then(container.NewDockerVolumeRemoveExecutor(rc.jobContainerName(), false))(ctx)
+		if rc.cleanUpJobContainer != nil {
+			return rc.cleanUpJobContainer(ctx)
 		}
 		return nil
 	}
 }
 
+func (rc *RunContext) pullServicesImages(forcePull bool) common.Executor {
+	return func(ctx context.Context) error {
+		execs := []common.Executor{}
+		for _, c := range rc.ServiceContainers {
+			execs = append(execs, c.Pull(forcePull))
+		}
+		return common.NewParallelExecutor(len(execs), execs...)(ctx)
+	}
+}
+
+func (rc *RunContext) startServiceContainers(_ string) common.Executor {
+	return func(ctx context.Context) error {
+		execs := []common.Executor{}
+		for _, c := range rc.ServiceContainers {
+			execs = append(execs, common.NewPipelineExecutor(
+				c.Pull(false),
+				c.Create(rc.Config.ContainerCapAdd, rc.Config.ContainerCapDrop),
+				c.Start(false),
+			))
+		}
+		return common.NewParallelExecutor(len(execs), execs...)(ctx)
+	}
+}
+
+func (rc *RunContext) waitForServiceContainer(c container.ExecutionsEnvironment) common.Executor {
+	return func(ctx context.Context) error {
+		sctx, cancel := context.WithTimeout(ctx, time.Minute*5)
+		defer cancel()
+		health := container.HealthStarting
+		delay := time.Second
+		for i := 0; ; i++ {
+			health = c.GetHealth(sctx)
+			if health != container.HealthStarting || i > 30 {
+				break
+			}
+			time.Sleep(delay)
+			delay *= 2
+			if delay > 10*time.Second {
+				delay = 10 * time.Second
+			}
+		}
+		if health == container.HealthHealthy {
+			return nil
+		}
+		return fmt.Errorf("service container failed to start")
+	}
+}
+
+func (rc *RunContext) waitForServiceContainers() common.Executor {
+	return func(ctx context.Context) error {
+		execs := []common.Executor{}
+		for _, c := range rc.ServiceContainers {
+			execs = append(execs, rc.waitForServiceContainer(c))
+		}
+		return common.NewParallelExecutor(len(execs), execs...)(ctx)
+	}
+}
+
+func (rc *RunContext) stopServiceContainers() common.Executor {
+	return func(ctx context.Context) error {
+		execs := []common.Executor{}
+		for _, c := range rc.ServiceContainers {
+			execs = append(execs, c.Remove().Finally(c.Close()))
+		}
+		return common.NewParallelExecutor(len(execs), execs...)(ctx)
+	}
+}
+
+// Prepare the mounts and binds for the worker
+
 // ActionCacheDir is for rc
 func (rc *RunContext) ActionCacheDir() string {
+	if rc.Config.ActionCacheDir != "" {
+		return rc.Config.ActionCacheDir
+	}
 	var xdgCache string
 	var ok bool
 	if xdgCache, ok = os.LookupEnv("XDG_CACHE_HOME"); !ok || xdgCache == "" {
-		if home, err := homedir.Dir(); err == nil {
+		if home, err := os.UserHomeDir(); err == nil {
 			xdgCache = filepath.Join(home, ".cache")
 		} else if xdgCache, err = filepath.Abs("."); err != nil {
-			log.Fatal(err)
+			// It's almost impossible to get here, so the temp dir is a good fallback
+			xdgCache = os.TempDir()
 		}
 	}
 	return filepath.Join(xdgCache, "act")
 }
 
-// Executor returns a pipeline executor for all the steps in the job
-func (rc *RunContext) Executor() common.Executor {
-	steps := make([]common.Executor, 0)
-
-	steps = append(steps, func(ctx context.Context) error {
-		if len(rc.Matrix) > 0 {
-			common.Logger(ctx).Infof("\U0001F9EA  Matrix: %v", rc.Matrix)
-		}
-		return nil
-	})
-
-	steps = append(steps, rc.startJobContainer())
-
-	for i, step := range rc.Run.Job().Steps {
-		if step.ID == "" {
-			step.ID = fmt.Sprintf("%d", i)
-		}
-		steps = append(steps, rc.newStepExecutor(step))
-	}
-	steps = append(steps, rc.stopJobContainer())
-
-	return common.NewPipelineExecutor(steps...).If(rc.isEnabled)
-}
-
-func (rc *RunContext) newStepExecutor(step *model.Step) common.Executor {
-	sc := &StepContext{
-		RunContext: rc,
-		Step:       step,
-	}
+// Interpolate outputs after a job is done
+func (rc *RunContext) interpolateOutputs() common.Executor {
 	return func(ctx context.Context) error {
-		rc.CurrentStep = sc.Step.ID
-		rc.StepResults[rc.CurrentStep] = &stepResult{
-			Success: true,
-			Outputs: make(map[string]string),
-		}
-
-		exprEval, err := sc.setupEnv(ctx)
-		if err != nil {
-			return err
-		}
-		rc.ExprEval = exprEval
-
-		runStep, err := rc.EvalBool(sc.Step.If)
-		if err != nil {
-			common.Logger(ctx).Errorf("  \u274C  Error in if: expression - %s", sc.Step)
-			rc.StepResults[rc.CurrentStep].Success = false
-			return err
-		}
-		if !runStep {
-			log.Debugf("Skipping step '%s' due to '%s'", sc.Step.String(), sc.Step.If)
-			return nil
-		}
-
-		common.Logger(ctx).Infof("\u2B50  Run %s", sc.Step)
-		err = sc.Executor()(ctx)
-		if err == nil {
-			common.Logger(ctx).Infof("  \u2705  Success - %s", sc.Step)
-		} else {
-			common.Logger(ctx).Errorf("  \u274C  Failure - %s", sc.Step)
-
-			if sc.Step.ContinueOnError {
-				common.Logger(ctx).Infof("Failed but continue next step")
-				err = nil
-				rc.StepResults[rc.CurrentStep].Success = true
-			} else {
-				rc.StepResults[rc.CurrentStep].Success = false
+		ee := rc.NewExpressionEvaluator(ctx)
+		for k, v := range rc.Run.Job().Outputs {
+			interpolated := ee.Interpolate(ctx, v)
+			if v != interpolated {
+				rc.Run.Job().Outputs[k] = interpolated
 			}
 		}
-		return err
+		return nil
 	}
 }
 
-func (rc *RunContext) platformImage() string {
+func (rc *RunContext) startContainer() common.Executor {
+	return func(ctx context.Context) error {
+		if rc.IsHostEnv(ctx) {
+			return rc.startHostEnvironment()(ctx)
+		}
+		return rc.startJobContainer()(ctx)
+	}
+}
+
+func (rc *RunContext) IsHostEnv(ctx context.Context) bool {
+	platform := rc.runsOnImage(ctx)
+	image := rc.containerImage(ctx)
+	return image == "" && strings.EqualFold(platform, "-self-hosted")
+}
+
+func (rc *RunContext) stopContainer() common.Executor {
+	return rc.stopJobContainer()
+}
+
+func (rc *RunContext) closeContainer() common.Executor {
+	return func(ctx context.Context) error {
+		if rc.JobContainer != nil {
+			return rc.JobContainer.Close()(ctx)
+		}
+		return nil
+	}
+}
+
+func (rc *RunContext) matrix() map[string]interface{} {
+	return rc.Matrix
+}
+
+func (rc *RunContext) result(result string) {
+	rc.Run.Job().Result = result
+}
+
+func (rc *RunContext) steps() []*model.Step {
+	return rc.Run.Job().Steps
+}
+
+// Executor returns a pipeline executor for all the steps in the job
+func (rc *RunContext) Executor() (common.Executor, error) {
+	var executor common.Executor
+	var jobType, err = rc.Run.Job().Type()
+
+	switch jobType {
+	case model.JobTypeDefault:
+		executor = newJobExecutor(rc, &stepFactoryImpl{}, rc)
+	case model.JobTypeReusableWorkflowLocal:
+		executor = newLocalReusableWorkflowExecutor(rc)
+	case model.JobTypeReusableWorkflowRemote:
+		executor = newRemoteReusableWorkflowExecutor(rc)
+	case model.JobTypeInvalid:
+		return nil, err
+	}
+
+	return func(ctx context.Context) error {
+		res, err := rc.isEnabled(ctx)
+		if err != nil {
+			return err
+		}
+		if res {
+			return executor(ctx)
+		}
+		return nil
+	}, nil
+}
+
+func (rc *RunContext) containerImage(ctx context.Context) string {
 	job := rc.Run.Job()
 
 	c := job.Container()
 	if c != nil {
-		return rc.ExprEval.Interpolate(c.Image)
+		return rc.ExprEval.Interpolate(ctx, c.Image)
 	}
 
-	if job.RunsOn() == nil {
-		log.Errorf("'runs-on' key not defined in %s", rc.String())
+	return ""
+}
+
+func (rc *RunContext) runsOnImage(ctx context.Context) string {
+	if rc.Run.Job().RunsOn() == nil {
+		common.Logger(ctx).Errorf("'runs-on' key not defined in %s", rc.String())
 	}
 
-	for _, runnerLabel := range job.RunsOn() {
-		platformName := rc.ExprEval.Interpolate(runnerLabel)
+	for _, platformName := range rc.runsOnPlatformNames(ctx) {
 		image := rc.Config.Platforms[strings.ToLower(platformName)]
 		if image != "" {
 			return image
@@ -276,91 +743,71 @@ func (rc *RunContext) platformImage() string {
 	return ""
 }
 
-func (rc *RunContext) isEnabled(ctx context.Context) bool {
+func (rc *RunContext) runsOnPlatformNames(ctx context.Context) []string {
+	job := rc.Run.Job()
+
+	if job.RunsOn() == nil {
+		return []string{}
+	}
+
+	if err := rc.ExprEval.EvaluateYamlNode(ctx, &job.RawRunsOn); err != nil {
+		common.Logger(ctx).Errorf("Error while evaluating runs-on: %v", err)
+		return []string{}
+	}
+
+	return job.RunsOn()
+}
+
+func (rc *RunContext) platformImage(ctx context.Context) string {
+	if containerImage := rc.containerImage(ctx); containerImage != "" {
+		return containerImage
+	}
+
+	return rc.runsOnImage(ctx)
+}
+
+func (rc *RunContext) options(ctx context.Context) string {
+	job := rc.Run.Job()
+	c := job.Container()
+	if c != nil {
+		return rc.ExprEval.Interpolate(ctx, c.Options)
+	}
+
+	return rc.Config.ContainerOptions
+}
+
+func (rc *RunContext) isEnabled(ctx context.Context) (bool, error) {
 	job := rc.Run.Job()
 	l := common.Logger(ctx)
-	runJob, err := rc.EvalBool(job.If)
-	if err != nil {
-		common.Logger(ctx).Errorf("  \u274C  Error in if: expression - %s", job.Name)
-		return false
+	runJob, runJobErr := EvalBool(ctx, rc.ExprEval, job.If.Value, exprparser.DefaultStatusCheckSuccess)
+	jobType, jobTypeErr := job.Type()
+
+	if runJobErr != nil {
+		return false, fmt.Errorf("  \u274C  Error in if-expression: \"if: %s\" (%s)", job.If.Value, runJobErr)
 	}
+
+	if jobType == model.JobTypeInvalid {
+		return false, jobTypeErr
+	}
+
 	if !runJob {
-		l.Debugf("Skipping job '%s' due to '%s'", job.Name, job.If)
-		return false
+		rc.result("skipped")
+		l.WithField("jobResult", "skipped").Debugf("Skipping job '%s' due to '%s'", job.Name, job.If.Value)
+		return false, nil
 	}
 
-	img := rc.platformImage()
+	if jobType != model.JobTypeDefault {
+		return true, nil
+	}
+
+	img := rc.platformImage(ctx)
 	if img == "" {
-		if job.RunsOn() == nil {
-			log.Errorf("'runs-on' key not defined in %s", rc.String())
+		for _, platformName := range rc.runsOnPlatformNames(ctx) {
+			l.Infof("\U0001F6A7  Skipping unsupported platform -- Try running with `-P %+v=...`", platformName)
 		}
-
-		for _, runnerLabel := range job.RunsOn() {
-			platformName := rc.ExprEval.Interpolate(runnerLabel)
-			l.Infof("\U0001F6A7  Skipping unsupported platform '%+v'", platformName)
-		}
-		return false
-	}
-	return true
-}
-
-var splitPattern *regexp.Regexp
-
-// EvalBool evaluates an expression against current run context
-func (rc *RunContext) EvalBool(expr string) (bool, error) {
-	if splitPattern == nil {
-		splitPattern = regexp.MustCompile(fmt.Sprintf(`%s|%s|\S+`, expressionPattern.String(), operatorPattern.String()))
-	}
-	if strings.HasPrefix(strings.TrimSpace(expr), "!") {
-		return false, errors.New("expressions starting with ! must be wrapped in ${{ }}")
-	}
-	if expr != "" {
-		parts := splitPattern.FindAllString(expr, -1)
-		var evaluatedParts []string
-		for i, part := range parts {
-			if operatorPattern.MatchString(part) {
-				evaluatedParts = append(evaluatedParts, part)
-				continue
-			}
-
-			interpolatedPart, isString := rc.ExprEval.InterpolateWithStringCheck(part)
-
-			// This peculiar transformation has to be done because the GitHub parser
-			// treats false returned from contexts as a string, not a boolean.
-			// Hence env.SOMETHING will be evaluated to true in an if: expression
-			// regardless if SOMETHING is set to false, true or any other string.
-			// It also handles some other weirdness that I found by trial and error.
-			if (expressionPattern.MatchString(part) && // it is an expression
-				!strings.Contains(part, "!")) && // but it's not negated
-				interpolatedPart == "false" && // and the interpolated string is false
-				(isString || previousOrNextPartIsAnOperator(i, parts)) { // and it's of type string or has an logical operator before or after
-
-				interpolatedPart = fmt.Sprintf("'%s'", interpolatedPart) // then we have to quote the false expression
-			}
-
-			evaluatedParts = append(evaluatedParts, interpolatedPart)
-		}
-
-		joined := strings.Join(evaluatedParts, " ")
-		v, _, err := rc.ExprEval.Evaluate(fmt.Sprintf("Boolean(%s)", joined))
-		if err != nil {
-			return false, err
-		}
-		log.Debugf("expression '%s' evaluated to '%s'", expr, v)
-		return v == "true", nil
+		return false, nil
 	}
 	return true, nil
-}
-
-func previousOrNextPartIsAnOperator(i int, parts []string) bool {
-	operator := false
-	if i > 0 {
-		operator = operatorPattern.MatchString(parts[i-1])
-	}
-	if i+1 < len(parts) {
-		operator = operator || operatorPattern.MatchString(parts[i+1])
-	}
-	return operator
 }
 
 func mergeMaps(maps ...map[string]string) map[string]string {
@@ -374,26 +821,16 @@ func mergeMaps(maps ...map[string]string) map[string]string {
 }
 
 func createContainerName(parts ...string) string {
-	name := make([]string, 0)
+	name := strings.Join(parts, "-")
 	pattern := regexp.MustCompile("[^a-zA-Z0-9]")
-	partLen := (30 / len(parts)) - 1
-	for i, part := range parts {
-		if i == len(parts)-1 {
-			name = append(name, pattern.ReplaceAllString(part, "-"))
-		} else {
-			// If any part has a '-<number>' on the end it is likely part of a matrix job.
-			// Let's preserve the number to prevent clashes in container names.
-			re := regexp.MustCompile("-[0-9]+$")
-			num := re.FindStringSubmatch(part)
-			if len(num) > 0 {
-				name = append(name, trimToLen(pattern.ReplaceAllString(part, "-"), partLen-len(num[0])))
-				name = append(name, num[0])
-			} else {
-				name = append(name, trimToLen(pattern.ReplaceAllString(part, "-"), partLen))
-			}
-		}
-	}
-	return strings.ReplaceAll(strings.Trim(strings.Join(name, "-"), "-"), "--", "-")
+	name = pattern.ReplaceAllString(name, "-")
+	name = strings.ReplaceAll(name, "--", "-")
+	hash := sha256.Sum256([]byte(name))
+
+	// SHA256 is 64 hex characters. So trim name to 63 characters to make room for the hash and separator
+	trimmedName := strings.Trim(trimToLen(name, 63), "-")
+
+	return fmt.Sprintf("%s-%x", trimmedName, hash)
 }
 
 func trimToLen(s string, l int) string {
@@ -406,76 +843,75 @@ func trimToLen(s string, l int) string {
 	return s
 }
 
-type jobContext struct {
-	Status    string `json:"status"`
-	Container struct {
-		ID      string `json:"id"`
-		Network string `json:"network"`
-	} `json:"container"`
-	Services map[string]struct {
-		ID string `json:"id"`
-	} `json:"services"`
-}
-
-func (rc *RunContext) getJobContext() *jobContext {
+func (rc *RunContext) getJobContext() *model.JobContext {
 	jobStatus := "success"
 	for _, stepStatus := range rc.StepResults {
-		if !stepStatus.Success {
+		if stepStatus.Conclusion == model.StepStatusFailure {
 			jobStatus = "failure"
 			break
 		}
 	}
-	return &jobContext{
+	return &model.JobContext{
 		Status: jobStatus,
 	}
 }
 
-func (rc *RunContext) getStepsContext() map[string]*stepResult {
+func (rc *RunContext) getStepsContext() map[string]*model.StepResult {
 	return rc.StepResults
 }
 
-type githubContext struct {
-	Event      map[string]interface{} `json:"event"`
-	EventPath  string                 `json:"event_path"`
-	Workflow   string                 `json:"workflow"`
-	RunID      string                 `json:"run_id"`
-	RunNumber  string                 `json:"run_number"`
-	Actor      string                 `json:"actor"`
-	Repository string                 `json:"repository"`
-	EventName  string                 `json:"event_name"`
-	Sha        string                 `json:"sha"`
-	Ref        string                 `json:"ref"`
-	HeadRef    string                 `json:"head_ref"`
-	BaseRef    string                 `json:"base_ref"`
-	Token      string                 `json:"token"`
-	Workspace  string                 `json:"workspace"`
-	Action     string                 `json:"action"`
-}
+func (rc *RunContext) getGithubContext(ctx context.Context) *model.GithubContext {
+	logger := common.Logger(ctx)
+	ghc := &model.GithubContext{
+		Event:            make(map[string]interface{}),
+		Workflow:         rc.Run.Workflow.Name,
+		RunAttempt:       rc.Config.Env["GITHUB_RUN_ATTEMPT"],
+		RunID:            rc.Config.Env["GITHUB_RUN_ID"],
+		RunNumber:        rc.Config.Env["GITHUB_RUN_NUMBER"],
+		Actor:            rc.Config.Actor,
+		EventName:        rc.Config.EventName,
+		Action:           rc.CurrentStep,
+		Token:            rc.Config.Token,
+		Job:              rc.Run.JobID,
+		ActionPath:       rc.ActionPath,
+		ActionRepository: rc.Env["GITHUB_ACTION_REPOSITORY"],
+		ActionRef:        rc.Env["GITHUB_ACTION_REF"],
+		RepositoryOwner:  rc.Config.Env["GITHUB_REPOSITORY_OWNER"],
+		RetentionDays:    rc.Config.Env["GITHUB_RETENTION_DAYS"],
+		RunnerPerflog:    rc.Config.Env["RUNNER_PERFLOG"],
+		RunnerTrackingID: rc.Config.Env["RUNNER_TRACKING_ID"],
+		Repository:       rc.Config.Env["GITHUB_REPOSITORY"],
+		Ref:              rc.Config.Env["GITHUB_REF"],
+		Sha:              rc.Config.Env["SHA_REF"],
+		RefName:          rc.Config.Env["GITHUB_REF_NAME"],
+		RefType:          rc.Config.Env["GITHUB_REF_TYPE"],
+		BaseRef:          rc.Config.Env["GITHUB_BASE_REF"],
+		HeadRef:          rc.Config.Env["GITHUB_HEAD_REF"],
+		Workspace:        rc.Config.Env["GITHUB_WORKSPACE"],
+	}
+	if rc.JobContainer != nil {
+		ghc.EventPath = rc.JobContainer.GetActPath() + "/workflow/event.json"
+		ghc.Workspace = rc.JobContainer.ToContainerPath(rc.Config.Workdir)
+	}
 
-func (rc *RunContext) getGithubContext() *githubContext {
-	token, ok := rc.Config.Secrets["GITHUB_TOKEN"]
-	if !ok {
-		token = os.Getenv("GITHUB_TOKEN")
+	if ghc.RunAttempt == "" {
+		ghc.RunAttempt = "1"
 	}
-	runID := rc.Config.Env["GITHUB_RUN_ID"]
-	if runID == "" {
-		runID = "1"
+
+	if ghc.RunID == "" {
+		ghc.RunID = "1"
 	}
-	runNumber := rc.Config.Env["GITHUB_RUN_NUMBER"]
-	if runNumber == "" {
-		runNumber = "1"
+
+	if ghc.RunNumber == "" {
+		ghc.RunNumber = "1"
 	}
-	ghc := &githubContext{
-		Event:     make(map[string]interface{}),
-		EventPath: fmt.Sprintf("%s/%s", filepath.Dir(rc.Config.Workdir), "workflow/event.json"),
-		Workflow:  rc.Run.Workflow.Name,
-		RunID:     runID,
-		RunNumber: runNumber,
-		Actor:     rc.Config.Actor,
-		EventName: rc.Config.EventName,
-		Token:     token,
-		Workspace: rc.Config.Workdir,
-		Action:    rc.CurrentStep,
+
+	if ghc.RetentionDays == "" {
+		ghc.RetentionDays = "0"
+	}
+
+	if ghc.RunnerPerflog == "" {
+		ghc.RunnerPerflog = "/dev/null"
 	}
 
 	// Backwards compatibility for configs that require
@@ -484,55 +920,62 @@ func (rc *RunContext) getGithubContext() *githubContext {
 		ghc.Actor = "nektos/act"
 	}
 
-	repoPath := rc.Config.Workdir
-	repo, err := common.FindGithubRepo(repoPath)
-	if err != nil {
-		log.Warningf("unable to get git repo: %v", err)
-	} else {
-		ghc.Repository = repo
-	}
-
-	_, sha, err := common.FindGitRevision(repoPath)
-	if err != nil {
-		log.Warningf("unable to get git revision: %v", err)
-	} else {
-		ghc.Sha = sha
-	}
-
-	ref, err := common.FindGitRef(repoPath)
-	if err != nil {
-		log.Warningf("unable to get git ref: %v", err)
-	} else {
-		log.Debugf("using github ref: %s", ref)
-		ghc.Ref = ref
-	}
 	if rc.EventJSON != "" {
-		err = json.Unmarshal([]byte(rc.EventJSON), &ghc.Event)
+		err := json.Unmarshal([]byte(rc.EventJSON), &ghc.Event)
 		if err != nil {
-			log.Errorf("Unable to Unmarshal event '%s': %v", rc.EventJSON, err)
+			logger.Errorf("Unable to Unmarshal event '%s': %v", rc.EventJSON, err)
 		}
 	}
 
-	// set the branch in the event data
-	if rc.Config.DefaultBranch != "" {
-		ghc.Event = withDefaultBranch(rc.Config.DefaultBranch, ghc.Event)
-	} else {
-		ghc.Event = withDefaultBranch("master", ghc.Event)
+	ghc.SetBaseAndHeadRef()
+	repoPath := rc.Config.Workdir
+	ghc.SetRepositoryAndOwner(ctx, rc.Config.GitHubInstance, rc.Config.RemoteName, repoPath)
+	if ghc.Ref == "" {
+		ghc.SetRef(ctx, rc.Config.DefaultBranch, repoPath)
+	}
+	if ghc.Sha == "" {
+		ghc.SetSha(ctx, repoPath)
 	}
 
-	if ghc.EventName == "pull_request" {
-		ghc.BaseRef = asString(nestedMapLookup(ghc.Event, "pull_request", "base", "ref"))
-		ghc.HeadRef = asString(nestedMapLookup(ghc.Event, "pull_request", "head", "ref"))
+	ghc.SetRefTypeAndName()
+
+	// defaults
+	ghc.ServerURL = "https://github.com"
+	ghc.APIURL = "https://api.github.com"
+	ghc.GraphQLURL = "https://api.github.com/graphql"
+	// per GHES
+	if rc.Config.GitHubInstance != "github.com" {
+		ghc.ServerURL = fmt.Sprintf("https://%s", rc.Config.GitHubInstance)
+		ghc.APIURL = fmt.Sprintf("https://%s/api/v3", rc.Config.GitHubInstance)
+		ghc.GraphQLURL = fmt.Sprintf("https://%s/api/graphql", rc.Config.GitHubInstance)
+	}
+	// allow to be overridden by user
+	if rc.Config.Env["GITHUB_SERVER_URL"] != "" {
+		ghc.ServerURL = rc.Config.Env["GITHUB_SERVER_URL"]
+	}
+	if rc.Config.Env["GITHUB_API_URL"] != "" {
+		ghc.APIURL = rc.Config.Env["GITHUB_API_URL"]
+	}
+	if rc.Config.Env["GITHUB_GRAPHQL_URL"] != "" {
+		ghc.GraphQLURL = rc.Config.Env["GITHUB_GRAPHQL_URL"]
 	}
 
 	return ghc
 }
 
-func (ghc *githubContext) isLocalCheckout(step *model.Step) bool {
+func isLocalCheckout(ghc *model.GithubContext, step *model.Step) bool {
+	if step.Type() == model.StepTypeInvalid {
+		// This will be errored out by the executor later, we need this here to avoid a null panic though
+		return false
+	}
 	if step.Type() != model.StepTypeUsesActionRemote {
 		return false
 	}
 	remoteAction := newRemoteAction(step.Uses)
+	if remoteAction == nil {
+		// IsCheckout() will nil panic if we dont bail out early
+		return false
+	}
 	if !remoteAction.IsCheckout() {
 		return false
 	}
@@ -544,15 +987,6 @@ func (ghc *githubContext) isLocalCheckout(step *model.Step) bool {
 		return false
 	}
 	return true
-}
-
-func asString(v interface{}) string {
-	if v == nil {
-		return ""
-	} else if s, ok := v.(string); ok {
-		return s
-	}
-	return ""
 }
 
 func nestedMapLookup(m map[string]interface{}, ks ...string) (rval interface{}) {
@@ -567,42 +1001,21 @@ func nestedMapLookup(m map[string]interface{}, ks ...string) (rval interface{}) 
 		return rval
 	} else if m, ok = rval.(map[string]interface{}); !ok {
 		return nil
-	} else { // 1+ more keys
-		return nestedMapLookup(m, ks[1:]...)
 	}
+	// 1+ more keys
+	return nestedMapLookup(m, ks[1:]...)
 }
 
-func withDefaultBranch(b string, event map[string]interface{}) map[string]interface{} {
-	repoI, ok := event["repository"]
-	if !ok {
-		repoI = make(map[string]interface{})
-	}
-
-	repo, ok := repoI.(map[string]interface{})
-	if !ok {
-		log.Warnf("unable to set default branch to %v", b)
-		return event
-	}
-
-	// if the branch is already there return with no changes
-	if _, ok = repo["default_branch"]; ok {
-		return event
-	}
-
-	repo["default_branch"] = b
-	event["repository"] = repo
-
-	return event
-}
-
-func (rc *RunContext) withGithubEnv(env map[string]string) map[string]string {
-	github := rc.getGithubContext()
+func (rc *RunContext) withGithubEnv(ctx context.Context, github *model.GithubContext, env map[string]string) map[string]string {
 	env["CI"] = "true"
-	env["GITHUB_ENV"] = fmt.Sprintf("%s/%s", filepath.Dir(rc.Config.Workdir), "workflow/envs.txt")
 	env["GITHUB_WORKFLOW"] = github.Workflow
+	env["GITHUB_RUN_ATTEMPT"] = github.RunAttempt
 	env["GITHUB_RUN_ID"] = github.RunID
 	env["GITHUB_RUN_NUMBER"] = github.RunNumber
 	env["GITHUB_ACTION"] = github.Action
+	env["GITHUB_ACTION_PATH"] = github.ActionPath
+	env["GITHUB_ACTION_REPOSITORY"] = github.ActionRepository
+	env["GITHUB_ACTION_REF"] = github.ActionRef
 	env["GITHUB_ACTIONS"] = "true"
 	env["GITHUB_ACTOR"] = github.Actor
 	env["GITHUB_REPOSITORY"] = github.Repository
@@ -611,23 +1024,31 @@ func (rc *RunContext) withGithubEnv(env map[string]string) map[string]string {
 	env["GITHUB_WORKSPACE"] = github.Workspace
 	env["GITHUB_SHA"] = github.Sha
 	env["GITHUB_REF"] = github.Ref
-	env["GITHUB_TOKEN"] = github.Token
-	env["GITHUB_SERVER_URL"] = "https://github.com"
-	env["GITHUB_API_URL"] = "https://api.github.com"
-	env["GITHUB_GRAPHQL_URL"] = "https://api.github.com/graphql"
+	env["GITHUB_REF_NAME"] = github.RefName
+	env["GITHUB_REF_TYPE"] = github.RefType
+	env["GITHUB_JOB"] = github.Job
+	env["GITHUB_REPOSITORY_OWNER"] = github.RepositoryOwner
+	env["GITHUB_RETENTION_DAYS"] = github.RetentionDays
+	env["RUNNER_PERFLOG"] = github.RunnerPerflog
+	env["RUNNER_TRACKING_ID"] = github.RunnerTrackingID
+	env["GITHUB_BASE_REF"] = github.BaseRef
+	env["GITHUB_HEAD_REF"] = github.HeadRef
+	env["GITHUB_SERVER_URL"] = github.ServerURL
+	env["GITHUB_API_URL"] = github.APIURL
+	env["GITHUB_GRAPHQL_URL"] = github.GraphQLURL
 
-	job := rc.Run.Job()
-	if job.RunsOn() != nil {
-		for _, runnerLabel := range job.RunsOn() {
-			platformName := rc.ExprEval.Interpolate(runnerLabel)
-			if platformName != "" {
-				if platformName == "ubuntu-latest" {
-					// hardcode current ubuntu-latest since we have no way to check that 'on the fly'
-					env["ImageOS"] = "ubuntu20"
-				} else {
-					platformName = strings.SplitN(strings.Replace(platformName, `-`, ``, 1), `.`, 1)[0]
-					env["ImageOS"] = platformName
-				}
+	if rc.Config.ArtifactServerPath != "" {
+		setActionRuntimeVars(rc, env)
+	}
+
+	for _, platformName := range rc.runsOnPlatformNames(ctx) {
+		if platformName != "" {
+			if platformName == "ubuntu-latest" {
+				// hardcode current ubuntu-latest since we have no way to check that 'on the fly'
+				env["ImageOS"] = "ubuntu20"
+			} else {
+				platformName = strings.SplitN(strings.Replace(platformName, `-`, ``, 1), `.`, 2)[0]
+				env["ImageOS"] = platformName
 			}
 		}
 	}
@@ -635,12 +1056,104 @@ func (rc *RunContext) withGithubEnv(env map[string]string) map[string]string {
 	return env
 }
 
-func (rc *RunContext) localCheckoutPath() (string, bool) {
-	ghContext := rc.getGithubContext()
-	for _, step := range rc.Run.Job().Steps {
-		if ghContext.isLocalCheckout(step) {
-			return step.With["path"], true
+func setActionRuntimeVars(rc *RunContext, env map[string]string) {
+	actionsRuntimeURL := os.Getenv("ACTIONS_RUNTIME_URL")
+	if actionsRuntimeURL == "" {
+		actionsRuntimeURL = fmt.Sprintf("http://%s:%s/", rc.Config.ArtifactServerAddr, rc.Config.ArtifactServerPort)
+	}
+	env["ACTIONS_RUNTIME_URL"] = actionsRuntimeURL
+	env["ACTIONS_RESULTS_URL"] = actionsRuntimeURL
+
+	actionsRuntimeToken := os.Getenv("ACTIONS_RUNTIME_TOKEN")
+	if actionsRuntimeToken == "" {
+		runID := int64(1)
+		if rid, ok := rc.Config.Env["GITHUB_RUN_ID"]; ok {
+			runID, _ = strconv.ParseInt(rid, 10, 64)
+		}
+		actionsRuntimeToken, _ = common.CreateAuthorizationToken(runID, runID, runID)
+	}
+	env["ACTIONS_RUNTIME_TOKEN"] = actionsRuntimeToken
+}
+
+func (rc *RunContext) handleCredentials(ctx context.Context) (string, string, error) {
+	// TODO: remove below 2 lines when we can release act with breaking changes
+	username := rc.Config.Secrets["DOCKER_USERNAME"]
+	password := rc.Config.Secrets["DOCKER_PASSWORD"]
+
+	container := rc.Run.Job().Container()
+	if container == nil || container.Credentials == nil {
+		return username, password, nil
+	}
+
+	if container.Credentials != nil && len(container.Credentials) != 2 {
+		err := fmt.Errorf("invalid property count for key 'credentials:'")
+		return "", "", err
+	}
+
+	ee := rc.NewExpressionEvaluator(ctx)
+	if username = ee.Interpolate(ctx, container.Credentials["username"]); username == "" {
+		err := fmt.Errorf("failed to interpolate container.credentials.username")
+		return "", "", err
+	}
+	if password = ee.Interpolate(ctx, container.Credentials["password"]); password == "" {
+		err := fmt.Errorf("failed to interpolate container.credentials.password")
+		return "", "", err
+	}
+
+	if container.Credentials["username"] == "" || container.Credentials["password"] == "" {
+		err := fmt.Errorf("container.credentials cannot be empty")
+		return "", "", err
+	}
+
+	return username, password, nil
+}
+
+func (rc *RunContext) handleServiceCredentials(ctx context.Context, creds map[string]string) (username, password string, err error) {
+	if creds == nil {
+		return
+	}
+	if len(creds) != 2 {
+		err = fmt.Errorf("invalid property count for key 'credentials:'")
+		return
+	}
+
+	ee := rc.NewExpressionEvaluator(ctx)
+	if username = ee.Interpolate(ctx, creds["username"]); username == "" {
+		err = fmt.Errorf("failed to interpolate credentials.username")
+		return
+	}
+
+	if password = ee.Interpolate(ctx, creds["password"]); password == "" {
+		err = fmt.Errorf("failed to interpolate credentials.password")
+		return
+	}
+
+	return
+}
+
+// GetServiceBindsAndMounts returns the binds and mounts for the service container, resolving paths as appropriate
+func (rc *RunContext) GetServiceBindsAndMounts(svcVolumes []string) ([]string, map[string]string) {
+	if rc.Config.ContainerDaemonSocket == "" {
+		rc.Config.ContainerDaemonSocket = "/var/run/docker.sock"
+	}
+	binds := []string{}
+	if rc.Config.ContainerDaemonSocket != "-" {
+		daemonPath := getDockerDaemonSocketMountPath(rc.Config.ContainerDaemonSocket)
+		binds = append(binds, fmt.Sprintf("%s:%s", daemonPath, "/var/run/docker.sock"))
+	}
+
+	mounts := map[string]string{}
+
+	for _, v := range svcVolumes {
+		if !strings.Contains(v, ":") || filepath.IsAbs(v) {
+			// Bind anonymous volume or host file.
+			binds = append(binds, v)
+		} else {
+			// Mount existing volume.
+			paths := strings.SplitN(v, ":", 2)
+			mounts[paths[0]] = paths[1]
 		}
 	}
-	return "", false
+
+	return binds, mounts
 }
